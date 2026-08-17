@@ -1,0 +1,545 @@
+TRAIN — ERA5 / new CDS patch
+Baseline: dbekaert/TRAIN @ 6c93feb (upstream master, 23 Jun 2019)
+Regenerated with: git diff -- <the seven files listed below>
+
+Complete record of the local code work, from the first GMT 6 fix onward:
+
+  APS_CONFIG.sh                         APS_toolbox pointed at this installation.
+                                        >>> The path is the placeholder
+                                        >>> /path/to/TRAIN — EDIT IT after
+                                        >>> applying; nothing in the chain works
+                                        >>> until it is an absolute path to your
+                                        >>> own TRAIN directory.
+  matlab/aps_load_era.m                 post-2024 CDS ERA5 netCDF reading,
+                                        pressure-level recovery for files damaged
+                                        by an in-place ncrename
+  matlab/aps_weather_model_SAR.m        era5 branch for the datapath + hourly
+                                        time list matching aps_era5_files.m
+  matlab/aps_weather_model_InSAR.m      era5 branch for the datapath
+  matlab/aps_weather_model_filenames.m  ggap*.nc name generation for era5
+  matlab/get_DEM.m                      n_columns/n_rows read with grdinfo -C
+                                        instead of the temp3 file (GMT 6), the
+                                        if fig_test==1 block restored, and the
+                                        input() prompt skipped under -batch
+  matlab/get_gmt_version.m              GMT 6 'usage:' string recognised
+
+Nothing is left out: `git diff` against 6c93feb reports these seven files and no
+others, and applying the patch to a clean checkout reproduces the six MATLAB
+files byte for byte.
+
+Apply with:  cd <TRAIN root> && git apply patches/TRAIN_ERA5_newCDS.patch
+
+diff --git a/APS_CONFIG.sh b/APS_CONFIG.sh
+index e642c76..63b06a5 100644
+--- a/APS_CONFIG.sh
++++ b/APS_CONFIG.sh
+@@ -17,7 +17,9 @@
+ #
+ 
+ # Give the correct path to the APS toolbox
+-export APS_toolbox="/nfs/see-fs-01_users/eedpsb/software/svn_aps"
++# EDIT THIS: absolute path to your TRAIN installation
++#            (the directory that contains matlab/ and bin/)
++export APS_toolbox="/path/to/TRAIN"
+ # export PYTHONPATH="${PYTHONPATH}:/nfs/see-fs-01_users/eedpsb/software/svn_aps/python_modules/"
+ # full path to the get_modis.py file
+ # export get_modis_filepath="/nfs/a1/software/python_packages/oscar-client-python/get_modis.py"
+diff --git a/matlab/aps_load_era.m b/matlab/aps_load_era.m
+index ada6d34..3b3b134 100644
+--- a/matlab/aps_load_era.m
++++ b/matlab/aps_load_era.m
+@@ -1,20 +1,39 @@
+-function [ Temp,WVapour,Geopot,Pressure,longrid,latgrid,xx,yy,lon0360_flag] = aps_load_era(file,era_data_type) 
++function [ Temp,WVapour,Geopot,Pressure,longrid,latgrid,xx,yy,lon0360_flag] = aps_load_era(file,era_data_type)
+ % loading ERA-I or ERA5 data from ECMWF website or ERA-I from BADC website
+ % Bekaert David
+ % modifications
+ % DB    10/04/2016  extract code from aps_era_SAR.m to make code modular
+ % DB 	07/06/2017  Update syntax to include ERA5 model
++% --    2026        Compatibility with the "new" Climate Data Store (CDS-Beta /
++%                   ecmwf-datastores) ERA5 netCDF files, see NEW-CDS notes below.
+ 
+-%%% Example on how to load netcdf files 
++%%% Example on how to load netcdf files
+ % ncid = netcdf.open(file,'NC_NOWRITE');
+ % [numdims,numvars,numglobalatts,unlimdimid] = netcdf.inq(ncid);
+-% [dimname, dimlen] = netcdf.inqDim(ncid,0); 
++% [dimname, dimlen] = netcdf.inqDim(ncid,0);
+ %
+ %         for k=1:numvars
+-%             [dimname, dimlen] = netcdf.inqVar(ncid,k-1); 
++%             [dimname, dimlen] = netcdf.inqVar(ncid,k-1);
+ %             fprintf([num2str(k-1) ' - ' dimname '\n'])
+ %         end
+ 
++% NEW-CDS: files retrieved from the CDS after the 2024 migration differ from
++% the legacy MARS/ERA-I netCDF this function was written for:
++%   1. the vertical coordinate is called "pressure_level" instead of "level"
++%      and the time coordinate "valid_time" instead of "time";
++%   2. they carry an "expver" variable of netCDF type NC_STRING, which cannot
++%      be cast with double() and used to abort the variable-reading loop;
++%   3. the variables are not stored in the legacy order, so reading latitude
++%      and longitude by their numeric id (1 and 0) returns the wrong arrays;
++%   4. "pressure_level" is stored in decreasing order (1000 -> 1 hPa) whereas
++%      the legacy "level" was increasing (1 -> 1000 hPa), so an unconditional
++%      flip no longer produces the surface-first ordering TRAIN expects;
++%   5. an in-place `ncrename` of the pressure_level/valid_time dimensions (a
++%      common workaround) silently blanks those coordinate variables in
++%      netCDF-4 files: the payload (z/t/r) survives but the pressure levels
++%      come back as all-NaN. Such files are recovered below instead of
++%      producing an all-NaN delay map.
++
+ % debug figure to test and validate dataloading.
+ debug_fig = 0;
+ 
+@@ -22,45 +41,85 @@ debug_fig = 0;
+ ncid = netcdf.open(file,'NC_NOWRITE');
+ 
+ % read netcdf variables and get number of variables
+-[numdims,numvars,numglobalatts,unlimdimid] = netcdf.inq(ncid);      
++[numdims,numvars,numglobalatts,unlimdimid] = netcdf.inq(ncid);
+ 
+ 
+ %% Swapping between BADC and ECMWF website data
+ if strcmpi(era_data_type,'ECMWF')
+     % ECMWF data has field data and a scale plus offset.
+-    % Depending if this exist its added to the data
+-    for i = 0:numvars-1          
++    % Depending if this exist its added to the data.
++    % NEW-CDS: collected in a struct keyed by variable name rather than in
++    % eval-created workspace variables, so that variables can be looked up by
++    % name and non-numeric ones (expver) can be skipped.
++    ncvars = struct();
++    for i = 0:numvars-1
+         [varname, xtype, dimids, numatts] = netcdf.inqVar(ncid,i);
+-        flag = 0;
++        scale = [];
++        offset = [];
+         for j = 0:numatts - 1
+             attname1 = netcdf.inqAttName(ncid,i,j);
+-            attname2 = netcdf.getAtt(ncid,i,attname1);
+ 
+             if strcmp('add_offset',attname1)
+-                offset = attname2;
++                offset = netcdf.getAtt(ncid,i,attname1);
+             end
+ 
+             if strcmp('scale_factor',attname1)
+-                scale = attname2;
+-                flag = 1;
++                scale = netcdf.getAtt(ncid,i,attname1);
+             end
+         end
+ 
+-        if flag
+-            eval([varname '= double(netcdf.getVar(ncid,i))*scale + offset;'])
+-        else
+-            eval([varname '= double(netcdf.getVar(ncid,i));'])
++        raw = netcdf.getVar(ncid,i);
++        % NEW-CDS: skip anything that is not a numeric field (NC_CHAR /
++        % NC_STRING, e.g. "expver"), double() would error out on those.
++        if (isnumeric(raw) || islogical(raw)) && isvarname(varname)
++            data = double(raw);
++            if ~isempty(scale)
++                data = data*double(scale);
++                if ~isempty(offset)
++                    data = data + double(offset);
++                end
++            end
++            ncvars.(varname) = data;
++            clear data
+         end
+-        clear varname xtype dimids numatts scale offset      
++        clear varname xtype dimids numatts scale offset raw
+     end
+ 
++    % NEW-CDS: fetch the fields by name, accepting both the legacy and the
++    % current CDS spellings of the vertical coordinate.
++    Temp    = aps_load_era_getvar(ncvars,{'t'});
++    Hum     = aps_load_era_getvar(ncvars,{'r'});
++    Geopot  = aps_load_era_getvar(ncvars,{'z'});
++    Plevs   = aps_load_era_getvar(ncvars,{'level','pressure_level','isobaricInhPa'});
++
++    if isempty(Temp) || isempty(Hum) || isempty(Geopot)
++        netcdf.close(ncid)
++        error(['aps_load_era: t, r or z missing from ' file])
++    end
+ 
+-    % flip along third dimension, ECMWF format flipped compared to BADC 
+-    Temp = t(:,:,end:-1:1);       
+-    Hum = r(:,:,end:-1:1);
+-    Geopot = z(:,:,end:-1:1);
+-    Plevs = flipud(level);
++    n_levels = size(Temp,3);
+ 
++    % NEW-CDS: recover the pressure levels when the coordinate variable is
++    % absent or has been blanked by an in-place ncrename.
++    if isempty(Plevs) || numel(Plevs)~=n_levels || ~all(isfinite(Plevs))
++        Plevs = aps_load_era_recover_plevs(file,n_levels,Geopot);
++    end
++    Plevs = Plevs(:);
++
++    % TRAIN expects the vertical axis surface-first (highest pressure at index
++    % 1). The legacy code achieved this with an unconditional flip of an
++    % increasing "level"; sorting explicitly gives the identical result for
++    % legacy files and also handles the decreasing "pressure_level" of the new
++    % CDS files.
++    [Plevs,ix_lev] = sort(Plevs,'descend');
++    Temp   = Temp(:,:,ix_lev);
++    Hum    = Hum(:,:,ix_lev);
++    Geopot = Geopot(:,:,ix_lev);
++
++    % NEW-CDS: latitude/longitude read by name, the variable order in the file
++    % is no longer the legacy one.
++    lats = aps_load_era_getvar(ncvars,{'latitude','lat'});
++    lons = aps_load_era_getvar(ncvars,{'longitude','lon'});
+ 
+ elseif strcmpi(era_data_type,'BADC')
+     % This is for ERA-I from BADC
+@@ -74,19 +133,27 @@ elseif strcmpi(era_data_type,'BADC')
+     Temp = double(netcdf.getVar(ncid,5));       % temp in K
+     Hum = double(netcdf.getVar(ncid,11));       % relative humidity in percent
+     Geopot = double(netcdf.getVar(ncid,4));     % Geopotential in m^2/s^2
+-    Plevs = double(netcdf.getVar(ncid,2));      % 37 pressure levels in hPa (or millibars) 1000 hPa at surface                   
++    Plevs = double(netcdf.getVar(ncid,2));      % 37 pressure levels in hPa (or millibars) 1000 hPa at surface
++    lats = [];
++    lons = [];
+ end
+ 
+ % Permute to a 3 D grid
+-Temp = permute(Temp,[2,1,3]);       
++Temp = permute(Temp,[2,1,3]);
+ Hum = permute(Hum,[2,1,3]);
+ Geopot = permute(Geopot,[2,1,3]);
+ 
+ 
+ % Same for lats and lons
+-lats = netcdf.getVar(ncid,1);
++% NEW-CDS: only fall back to the positional read when the named lookup above
++% did not resolve (BADC files, or an unexpected layout).
++if isempty(lats) || isempty(lons)
++    lats = double(netcdf.getVar(ncid,1));
++    lons = double(netcdf.getVar(ncid,0));
++end
++lats = double(lats(:));
++lons = double(lons(:));
+ n_latitude_points = size(lats,1);
+-lons = netcdf.getVar(ncid,0);
+ n_longitude_points = size(lons,1);
+ 
+ 
+@@ -95,27 +162,29 @@ netcdf.close(ncid)
+ 
+ 
+ % adapting to the right lon lat grid size
++n_levels = numel(Plevs);
+ Pressure = repmat(Plevs,[1,n_latitude_points,n_longitude_points]);
+ Pressure = permute(Pressure,[2,3,1]);
+ 
+ 
+-latgrid = repmat(lats,[1,37,n_longitude_points]);
++% NEW-CDS: use the actual number of pressure levels instead of a hard-coded 37
++latgrid = repmat(lats,[1,n_levels,n_longitude_points]);
+ latgrid = permute(latgrid,[1,3,2]);
+-longrid = repmat(lons,[1,37,n_latitude_points]);
++longrid = repmat(lons,[1,n_levels,n_latitude_points]);
+ longrid = permute(longrid,[3,1,2]);
+ 
+ % Get list of points to look at in analysis
+ [xx,yy] = meshgrid(1:n_longitude_points,1:n_latitude_points);
+ 
+ 
+-% (see IFS documentation part 2: Data assimilation (CY25R1)). 
++% (see IFS documentation part 2: Data assimilation (CY25R1)).
+ % Calculate saturated water vapour pressure (svp) for water
+ % (svpw) using Buck 1881 and for ice (swpi) from Alduchow
+ % and Eskridge (1996) euation AERKi
+ svpw = 6.1121.*exp((17.502.*(Temp-273.16))./(240.97+Temp-273.16));
+ svpi = 6.1121.*exp((22.587.*(Temp-273.16))./(273.86+Temp-273.16));
+ tempbound1 = 273.16; %0
+-tempbound2 = 250.16; %-23      
++tempbound2 = 250.16; %-23
+ svp = svpw;
+ 
+ % Faster expression
+@@ -220,3 +289,117 @@ end
+ 
+ 
+ 
++end
++
++
++function data = aps_load_era_getvar(ncvars,names)
++% NEW-CDS: return the first field of the ncvars struct matching one of names,
++% or [] when none of them is present.
++data = [];
++for k = 1:numel(names)
++    if isfield(ncvars,names{k})
++        data = ncvars.(names{k});
++        return
++    end
++end
++end
++
++
++function Plevs = aps_load_era_recover_plevs(file,n_levels,Geopot)
++% NEW-CDS: rebuild the pressure level vector of a weather model file whose
++% vertical coordinate variable is missing or has been blanked (all NaN) by an
++% in-place `ncrename` on a netCDF-4 file. The z/t/r payload of such files is
++% intact, only the coordinate is lost, so the run can be salvaged without
++% touching the data on disk.
++%
++% Sources, in order of preference:
++%   1. a sibling weather model file of the same run that still has a readable
++%      vertical coordinate;
++%   2. the standard ECMWF pressure level sets (37 or 25 levels).
++% The recovered vector is then oriented against the geopotential so that it is
++% paired with the correct level index regardless of how the file stores them.
++
++Plevs = [];
++level_names = {'level','pressure_level','isobaricInhPa'};
++
++% ---- 1. sibling files ---------------------------------------------------
++[fdir,~,fext] = fileparts(file);
++search_dirs = {fdir};
++parentdir = fileparts(fdir);
++if ~isempty(parentdir)
++    sub = dir(parentdir);
++    for k = 1:numel(sub)
++        if sub(k).isdir && ~strcmp(sub(k).name,'.') && ~strcmp(sub(k).name,'..')
++            search_dirs{end+1} = fullfile(parentdir,sub(k).name); %#ok<AGROW>
++        end
++    end
++end
++
++for s = 1:numel(search_dirs)
++    cand = dir(fullfile(search_dirs{s},['*' fext]));
++    for c = 1:numel(cand)
++        candfile = fullfile(search_dirs{s},cand(c).name);
++        if strcmp(candfile,file)
++            continue
++        end
++        try
++            info = ncinfo(candfile);
++        catch
++            continue
++        end
++        vn = {info.Variables.Name};
++        for L = 1:numel(level_names)
++            if any(strcmp(vn,level_names{L}))
++                try
++                    trial = double(ncread(candfile,level_names{L}));
++                catch
++                    continue
++                end
++                trial = trial(:);
++                if numel(trial)==n_levels && all(isfinite(trial)) && all(trial>0)
++                    Plevs = trial;
++                    fprintf(['aps_load_era: pressure levels of ' file ...
++                             ' are unreadable, recovered from ' candfile '\n']);
++                    break
++                end
++            end
++        end
++        if ~isempty(Plevs), break, end
++    end
++    if ~isempty(Plevs), break, end
++end
++
++% ---- 2. standard ECMWF pressure level sets ------------------------------
++if isempty(Plevs)
++    plevs37 = [1000 975 950 925 900 875 850 825 800 775 750 700 650 600 550 ...
++               500 450 400 350 300 250 225 200 175 150 125 100 70 50 30 20 ...
++               10 7 5 3 2 1]';
++    plevs25 = [1000 975 950 925 900 875 850 825 800 775 750 700 650 600 550 ...
++               500 450 400 350 300 250 225 200 175 150]';
++    if n_levels==numel(plevs37)
++        Plevs = plevs37;
++    elseif n_levels==numel(plevs25)
++        Plevs = plevs25;
++    else
++        error(['aps_load_era: the pressure levels of ' file ' are unreadable ' ...
++               '(likely blanked by an in-place ncrename) and cannot be ' ...
++               'reconstructed for ' num2str(n_levels) ' levels. Re-download ' ...
++               'this file from the CDS.']);
++    end
++    fprintf(['aps_load_era: pressure levels of ' file ' are unreadable, ' ...
++             'falling back on the standard ' num2str(n_levels) ...
++             '-level ECMWF set\n']);
++end
++
++% ---- 3. orient against the geopotential ---------------------------------
++% Geopotential grows with altitude, i.e. with decreasing pressure. Whichever
++% end of the level axis carries the smaller geopotential is the surface end
++% and must be paired with the highest pressure.
++z_first = mean(reshape(Geopot(:,:,1),[],1),'omitnan');
++z_last  = mean(reshape(Geopot(:,:,end),[],1),'omitnan');
++if z_first <= z_last
++    Plevs = sort(Plevs,'descend');
++else
++    Plevs = sort(Plevs,'ascend');
++end
++end
+diff --git a/matlab/aps_weather_model_InSAR.m b/matlab/aps_weather_model_InSAR.m
+index 8113ae4..6c5b1d7 100644
+--- a/matlab/aps_weather_model_InSAR.m
++++ b/matlab/aps_weather_model_InSAR.m
+@@ -62,15 +62,17 @@ ll_matfile = getparm_aps('ll_matfile',1);
+ ifgday_matfile = getparm_aps('ifgday_matfile');
+ 
+ model_type = lower(model_type);
+-if strcmpi(model_type,'era')
++% era5 shares era_datapath with era; without this branch
++% aps_weather_model('era5',3,...) aborts on the error below.
++if strcmpi(model_type,'era') || strcmpi(model_type,'era5')
+     weather_model_datapath = getparm_aps('era_datapath',1);
+ elseif strcmpi(model_type,'merra') || strcmpi(model_type,'merra2')
+     weather_model_datapath = getparm_aps('merra_datapath',1);
+ elseif strcmpi(model_type,'gacos')
+     weather_model_datapath = getparm_aps('gacos_datapath',1);
+ else
+-    error('Not a supported model: either: ERA, MERRA, MERRA2, GACOS')
+-end 
++    error('Not a supported model: either: ERA, ERA5, MERRA, MERRA2, GACOS')
++end
+ lambda = getparm_aps('lambda',1)*100;                       % radar wavelength in cm
+ datestructure = 'yyyymmdd';                               % assumed date structure for era
+ inc_angle =  getparm_aps('look_angle',1);
+diff --git a/matlab/aps_weather_model_SAR.m b/matlab/aps_weather_model_SAR.m
+index c5a94e3..deebef2 100644
+--- a/matlab/aps_weather_model_SAR.m
++++ b/matlab/aps_weather_model_SAR.m
+@@ -106,6 +106,15 @@ stamps_processed = getparm_aps('stamps_processed',1);
+ if strcmp(model_type,'narr')
+     timelist_model = ['0000' ;'0300'; '0600' ; '0900'; '1200' ;'1500'; '1800' ;'2100'; '0000'];
+     model_lag = 8*7;    % days
++elseif strcmpi(model_type,'era5')
++    % ERA5 is distributed hourly. The 6 hourly ERA-Interim list would make
++    % this step look for time stamps that aps_era5_files.m never orders or
++    % downloads, so use the same hourly list as that function.
++    timelist_model= ['0000' ; '0100' ; '0200' ; '0300' ; '0400' ; '0500' ; ...
++                     '0600' ; '0700' ; '0800' ; '0900' ; '1000' ; '1100' ; ...
++                     '1200' ; '1300' ; '1400' ; '1500' ; '1600' ; '1700' ; ...
++                     '1800' ; '1900' ; '2000' ; '2100' ; '2200' ; '2300' ; '0000'];
++    model_lag = 0; % ? check lags
+ else
+     timelist_model= ['0000' ; '0600' ; '1200' ; '1800' ; '0000'];       % the time interval the model is outputed
+     model_lag = 0; % ? check lags
+@@ -114,16 +123,18 @@ era_data_type = [];                                                 % the weathe
+ 
+ 
+ %%% Updating specific weather model information
+-if strcmpi(model_type,'era')
++% era5 shares era_datapath and the ECMWF/BADC data type with era. Without
++% this branch aps_weather_model('era5',2,...) aborts on the error below.
++if strcmpi(model_type,'era') || strcmpi(model_type,'era5')
+     weather_model_datapath = getparm_aps('era_datapath',1);
+     era_data_type = getparm_aps('era_data_type');         % the datatype of the model either BADC or ERA
+ elseif strcmpi(model_type,'merra') || strcmpi(model_type,'merra2')
+-    weather_model_datapath = getparm_aps('merra_datapath',1); 
+-elseif strcmpi(model_type,'narr') 
+-    weather_model_datapath = getparm_aps('narr_datapath',1); 
++    weather_model_datapath = getparm_aps('merra_datapath',1);
++elseif strcmpi(model_type,'narr')
++    weather_model_datapath = getparm_aps('narr_datapath',1);
+ 
+ else
+-    error(['weather model type not supported, either: wrf, era, narr, merra for now'])
++    error(['weather model type not supported, either: wrf, era, era5, narr, merra for now'])
+ end
+ 
+ lambda = getparm_aps('lambda',1)*100;                       % radar wavelength in cm
+diff --git a/matlab/aps_weather_model_filenames.m b/matlab/aps_weather_model_filenames.m
+index f6512a7..690fbd8 100644
+--- a/matlab/aps_weather_model_filenames.m
++++ b/matlab/aps_weather_model_filenames.m
+@@ -34,7 +34,9 @@ if nargin<6
+ end
+ 
+ for d =1:size(date_before,1)
+-    if strcmpi(model_type,'era')    
++    if strcmpi(model_type,'era') || strcmpi(model_type,'era5')
++        % era5 uses the same ggap naming and folder layout as era; without
++        % this branch modelfile_before/after stay undefined for era5.
+         %Format ggapYYYYMMDDHHMM.nc
+         modelfile_before(d,:) = [weather_model_datapath filesep date_before(d,:) filesep 'ggap' date_before(d,:) time_before(d,:) '.nc']; 
+         modelfile_after(d,:) = [weather_model_datapath filesep date_after(d,:) filesep 'ggap' date_after(d,:) time_after(d,:) '.nc'];
+diff --git a/matlab/get_DEM.m b/matlab/get_DEM.m
+index ca4c60a..c2d18bc 100644
+--- a/matlab/get_DEM.m
++++ b/matlab/get_DEM.m
+@@ -364,27 +364,17 @@ dem = data(:,3);
+ clear data data_vector
+ 
+ 
+-%% load the resampled DEM
+-if strcmp(gmt5_above,'y')
+-    nncols_cmd = ['echo `' GMT_string 'grdinfo tmp_smp.grd | grep n_columns | awk ''{print $NF}''`>', path_dem ,filesep ,'temp3'];
+-    nnrows_cmd = ['echo `' GMT_string 'grdinfo tmp_smp.grd | grep n_rows | awk ''{print $NF}''`>>', path_dem ,filesep ,'temp3'];
+-else
+-    nncols_cmd = ['echo `' GMT_string 'grdinfo tmp_smp.grd | grep nx | awk ''{print $NF}''`>', path_dem ,filesep ,'temp3'];
+-    nnrows_cmd = ['echo `' GMT_string 'grdinfo tmp_smp.grd | grep ny | awk ''{print $NF}''`>>', path_dem ,filesep ,'temp3'];
+-end
+-aps_systemcall(nncols_cmd);
+-aps_systemcall(nnrows_cmd);
+-
+-DEM_info = load([path_dem ,filesep 'temp3']);
+-aps_systemcall(['rm ' path_dem ,filesep 'temp3']);
++%% load the resampled DEM  (PATCH: read grdinfo directly, no temp3 file)
++[~, ncol_str] = system([GMT_string 'grdinfo -C tmp_smp.grd | awk ''{print $10}''']);
++[~, nrow_str] = system([GMT_string 'grdinfo -C tmp_smp.grd | awk ''{print $11}''']);
++DEM_info = [str2double(ncol_str); str2double(nrow_str)];
+ nncols = DEM_info(1);
+ nnrows = DEM_info(2);
+-clear DEM_info
+-dem =reshape(dem,nncols,nnrows)';
++dem = reshape(dem,nncols,nnrows)';
+ 
+ if fig_test ==1
+     figure('name','DEM debug test');
+-    imagesc([xmin xmax],[ymax ymin],dem)   
++    imagesc([xmin xmax],[ymax ymin],dem)
+     colorbar
+     view(0,90)
+     axis equal
+@@ -392,12 +382,20 @@ if fig_test ==1
+     axis xy
+ 
+     % check if this is correct
+-    str='';
+-    while ~strcmpi(str,'y') && ~strcmpi(str,'n')
+-        fprintf(['Does the DEM look reasonable? \n'])
+-        str = input('Continue? [y: for yes, n: no] \n','s');
+-    end
+-    if strcmpi(str,'n')
+-        error('Check the dem input file.')
++    % HEADLESS: input() throws "Support for user input is required, which is
++    % not available on this platform" under `matlab -batch` / -nodisplay, which
++    % aborts any non-interactive run of the APS chain. Only prompt when there
++    % actually is somebody to answer.
++    if batchStartupOptionUsed
++        fprintf('Batch mode: skipping the interactive DEM check\n')
++    else
++        str='';
++        while ~strcmpi(str,'y') && ~strcmpi(str,'n')
++            fprintf(['Does the DEM look reasonable? \n'])
++            str = input('Continue? [y: for yes, n: no] \n','s');
++        end
++        if strcmpi(str,'n')
++            error('Check the dem input file.')
++        end
+     end
+ end
+diff --git a/matlab/get_gmt_version.m b/matlab/get_gmt_version.m
+index 42bdefb..5747290 100644
+--- a/matlab/get_gmt_version.m
++++ b/matlab/get_gmt_version.m
+@@ -140,7 +140,7 @@ end
+ if gmt_function_does_not_work~=0
+     [gmt_function_does_not_work, b] = system([GMT_string ' ' command_str]);
+     if ~isempty(b)
+-       ix = findstr('usage: psxy',b);
++       ix = findstr('usage:',b);
+        if ~isempty(ix)
+            gmt_function_does_not_work = 0;
+            fprintf(['WARNING: GMT functions need to be preceded by ' GMT_string(1:end-1) ': e.g. ' GMT_string 'xyz2grd \n'])
